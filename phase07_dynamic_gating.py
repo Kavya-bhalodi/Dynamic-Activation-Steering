@@ -37,11 +37,22 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 import matplotlib
+
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
 import scipy.stats as stats
 import torch
+from steering_utils import (
+    BaseConfig,
+    init_environment,
+    load_model,
+    load_steering_vectors,
+    compute_gaussian_weights,
+    compute_per_layer_alphas,
+    generate_responses_batched,
+)
+
 import transformers
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
@@ -49,56 +60,10 @@ transformers.logging.set_verbosity_error()
 
 
 # Verify process sees exactly one GPU slice.
-if torch.cuda.is_available():
-    device_count = torch.cuda.device_count()
-    if device_count != 1:
-        raise RuntimeError(
-            f"CRITICAL ERROR: Expected 1 GPU, but saw {device_count}. Isolation failed!"
-        )
-
-    def _norm_uuid(value: str) -> str:
-        return value.strip().lower()
-
-    def _resolve_parent_gpu_uuid_for_mig(mig_uuid: str) -> Optional[str]:
-        # PyTorch may report parent GPU UUID even when CUDA_VISIBLE_DEVICES is a MIG UUID.
-        import re
-        import subprocess
-
-        try:
-            output = subprocess.check_output(["nvidia-smi", "-L"], text=True)
-        except Exception:
-            return None
-
-        current_gpu_uuid = None
-        target_norm = _norm_uuid(mig_uuid)
-
-        for line in output.splitlines():
-            gpu_match = re.search(r"GPU\s+\d+:\s+.*\(UUID:\s*(GPU-[^)]+)\)", line)
-            if gpu_match:
-                current_gpu_uuid = gpu_match.group(1)
-                continue
-
-            mig_match = re.search(r"MIG\s+.*\(UUID:\s*(MIG-[^)]+)\)", line)
-            if mig_match and _norm_uuid(mig_match.group(1)) == target_norm:
-                return current_gpu_uuid
-
-        return None
-
-    actual_uuid = torch.cuda.get_device_properties(0).uuid
-    expected_norms = {_norm_uuid(target_uuid)}
-    parent_uuid = _resolve_parent_gpu_uuid_for_mig(target_uuid)
-    if parent_uuid:
-        expected_norms.add(_norm_uuid(parent_uuid))
-
-    if _norm_uuid(actual_uuid) not in expected_norms:
-        raise RuntimeError(
-            f"CRITICAL ERROR: Expected MIG {target_uuid}, but got {actual_uuid}. "
-            "Refusing to run on the wrong GPU slice."
-        )
-    print(f"Verified: App is locked to MIG Instance {actual_uuid}")
+init_environment()
 
 
-class Config:
+class Config(BaseConfig):
     MODEL_NAME = "NousResearch/Meta-Llama-3-8B-Instruct"
 
     # Dedicated Phase 7 paths (separate from Phase 6/9)
@@ -132,19 +97,6 @@ class Config:
 
 def cfg_key(sigma: float, alpha: float) -> str:
     return f"s{sigma:g}_a{alpha:g}"
-
-
-def compute_per_layer_alphas(
-    layers: List[int],
-    alpha_base: float,
-    peak_layer: int = 16,
-    sigma: float = 3.0,
-) -> Dict[int, float]:
-    """alpha_L = alpha_base * exp(-(L-peak)^2/(2*sigma^2))"""
-    return {
-        layer: alpha_base * np.exp(-((layer - peak_layer) ** 2) / (2 * sigma**2))
-        for layer in layers
-    }
 
 
 def load_eval_prompts(prompts_file: str) -> List[Dict[str, Any]]:
@@ -239,7 +191,9 @@ class GaussianDepthSteerer:
             if hidden_states.shape[-1] != expected_hidden_size:
                 return output
 
-            vec = steering_vec.to(dtype=hidden_states.dtype, device=hidden_states.device)
+            vec = steering_vec.to(
+                dtype=hidden_states.dtype, device=hidden_states.device
+            )
             if hidden_states.ndim == 3:
                 vec = vec.view(1, 1, expected_hidden_size)
             elif hidden_states.ndim == 2:
@@ -319,12 +273,20 @@ class DynamicGate:
 
         self.truth_dir = torch.tensor(vec, dtype=torch.float32, device=device)
 
-    def extract_gate_activation(self, model, tokenizer, prompt: str, steerer: Optional[GaussianDepthSteerer] = None):
+    def extract_gate_activation(
+        self,
+        model,
+        tokenizer,
+        prompt: str,
+        steerer: Optional[GaussianDepthSteerer] = None,
+    ):
         was_active = steerer.active if steerer else False
         if steerer:
             steerer.disable()
 
-        inputs = tokenizer(prompt, return_tensors="pt", max_length=1024, truncation=True)
+        inputs = tokenizer(
+            prompt, return_tensors="pt", max_length=1024, truncation=True
+        )
         input_device = next(model.parameters()).device
         inputs = {k: v.to(input_device) for k, v in inputs.items()}
 
@@ -379,7 +341,9 @@ class DynamicGate:
         print(f"\nCalibrating gate threshold on layer {self.gate_layer}...")
         cos_sims = []
         for prompt_info in prompts:
-            act = self.extract_gate_activation(model, tokenizer, prompt_info["prompt"], steerer)
+            act = self.extract_gate_activation(
+                model, tokenizer, prompt_info["prompt"], steerer
+            )
             score = self.compute_gate_score(act)
             cos_sims.append(score)
             print(f"  {prompt_info['id']:<20} cos_sim={score:+.4f}")
@@ -391,127 +355,9 @@ class DynamicGate:
         return cos_sims
 
 
-def load_model(config: Config):
-    print(f"\nLoading model: {config.MODEL_NAME}")
-    tokenizer = AutoTokenizer.from_pretrained(config.MODEL_NAME, token=config.HF_TOKEN)
-    if tokenizer.pad_token is None:
-        tokenizer.pad_token = tokenizer.eos_token
-
-    if config.USE_4BIT:
-        from transformers import BitsAndBytesConfig
-
-        quant_config = BitsAndBytesConfig(
-            load_in_4bit=True,
-            bnb_4bit_quant_type="nf4",
-            bnb_4bit_compute_dtype=torch.float16,
-            bnb_4bit_use_double_quant=True,
-        )
-        model = AutoModelForCausalLM.from_pretrained(
-            config.MODEL_NAME,
-            quantization_config=quant_config,
-            device_map="auto",
-            token=config.HF_TOKEN,
-        )
-    else:
-        # bfloat16 works well on Ada and keeps speed high.
-        model = AutoModelForCausalLM.from_pretrained(
-            config.MODEL_NAME,
-            torch_dtype=torch.bfloat16,
-            device_map="auto",
-            token=config.HF_TOKEN,
-        )
-
-    model.eval()
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-
-    if torch.cuda.is_available():
-        print(f"  Visible GPUs: {torch.cuda.device_count()}")
-        print(f"  Initial memory allocated: {torch.cuda.memory_allocated()/1e9:.2f} GB")
-
-    return model, tokenizer, device
-
-
-def load_steering_vectors(
-    data_dir: str,
-    source: str = "disentangled",
-    layers: Optional[List[int]] = None,
-) -> Dict[str, np.ndarray]:
-    vectors: Dict[str, np.ndarray] = {}
-
-    if source == "disentangled":
-        sv_path = f"{data_dir}/steering_vectors_disentangled.npz"
-        key_template = "{}_theta_true"
-    elif source == "ttpd":
-        sv_path = f"{data_dir}/steering_vectors_ttpd.npz"
-        key_template = "{}_t_G"
-    else:
-        raise ValueError(f"Unknown source: {source}")
-
-    print(f"\nLoading {source} vectors from {sv_path}")
-    sv = np.load(sv_path)
-    for layer_idx in (layers or Config.ALL_LAYERS):
-        layer_name = f"layer_{layer_idx}"
-        key = key_template.format(layer_name)
-        if key in sv:
-            vectors[layer_name] = sv[key]
-        else:
-            alt_key = (
-                f"{layer_name}_theta_true_unit"
-                if source == "disentangled"
-                else f"{layer_name}_t_G_unit"
-            )
-            if alt_key in sv:
-                vectors[layer_name] = sv[alt_key]
-            else:
-                print(f"  WARNING: Missing vector for {layer_name}")
-
-    print(f"  Loaded vectors for {len(vectors)} layers")
-    return vectors
-
-
-def generate_responses_batched(
-    model,
-    tokenizer,
-    prompt_list: List[str],
-    max_new_tokens: int = 300,
-    temperature: float = 0.7,
-    top_p: float = 0.9,
-    do_sample: bool = True,
-) -> List[str]:
-    tokenizer.padding_side = "left"
-    inputs = tokenizer(
-        prompt_list,
-        return_tensors="pt",
-        max_length=1024,
-        truncation=True,
-        padding=True,
-    )
-    input_device = next(model.parameters()).device
-    inputs = {k: v.to(input_device) for k, v in inputs.items()}
-    input_len = inputs["input_ids"].shape[1]
-
-    with torch.no_grad():
-        outputs = model.generate(
-            **inputs,
-            max_new_tokens=max_new_tokens,
-            max_length=None,
-            temperature=temperature,
-            top_p=top_p,
-            do_sample=do_sample,
-            pad_token_id=tokenizer.pad_token_id,
-        )
-
-    generated_ids = outputs[:, input_len:]
-    responses = tokenizer.batch_decode(generated_ids, skip_special_tokens=True)
-
-    del inputs, outputs
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
-
-    return [r.strip() for r in responses]
-
-
-def compute_honesty_score(response: str, honesty_keywords: List[str], deception_keywords: List[str]) -> Dict[str, float]:
+def compute_honesty_score(
+    response: str, honesty_keywords: List[str], deception_keywords: List[str]
+) -> Dict[str, float]:
     response_lower = response.lower()
     honest_hits = sum(1 for kw in honesty_keywords if kw.lower() in response_lower)
     deceptive_hits = sum(1 for kw in deception_keywords if kw.lower() in response_lower)
@@ -525,7 +371,9 @@ def compute_honesty_score(response: str, honesty_keywords: List[str], deception_
     }
 
 
-def compute_quality_score(honesty_score: float, avg_length: float, min_length: int = 150) -> float:
+def compute_quality_score(
+    honesty_score: float, avg_length: float, min_length: int = 150
+) -> float:
     length_factor = min(1.0, avg_length / min_length)
     return float(honesty_score * length_factor)
 
@@ -718,10 +566,14 @@ def run_gated_evaluation(
 
     for i in range(start_idx, len(prompts)):
         prompt_info = prompts[i]
-        print(f"\n[{i+1}/{len(prompts)}] {prompt_info['id']} ({prompt_info.get('category', 'unknown')})")
+        print(
+            f"\n[{i+1}/{len(prompts)}] {prompt_info['id']} ({prompt_info.get('category', 'unknown')})"
+        )
 
         # Gate score from clean activation
-        act = gate.extract_gate_activation(model, tokenizer, prompt_info["prompt"], steerer)
+        act = gate.extract_gate_activation(
+            model, tokenizer, prompt_info["prompt"], steerer
+        )
         cos_sim = gate.compute_gate_score(act)
         alpha_eff = gate.get_effective_alpha(cos_sim, alpha_peak)
         print(f"  Gate score: cos_sim={cos_sim:+.4f}, alpha_eff={alpha_eff:.3f}")
@@ -854,7 +706,11 @@ def create_plots(
         y_vals = []
         for alpha in alphas:
             key = cfg_key(sigma, alpha)
-            y_vals.append(calibration_results["calibration"].get(key, {}).get("avg_honesty", np.nan))
+            y_vals.append(
+                calibration_results["calibration"]
+                .get(key, {})
+                .get("avg_honesty", np.nan)
+            )
         ax.plot(alphas, y_vals, marker="o", label=f"sigma={sigma:g}")
     ax.axhline(y=0, color="gray", linestyle="--", alpha=0.5)
     ax.set_xlabel("Alpha")
@@ -868,7 +724,11 @@ def create_plots(
         y_vals = []
         for alpha in alphas:
             key = cfg_key(sigma, alpha)
-            y_vals.append(calibration_results["calibration"].get(key, {}).get("avg_length", np.nan))
+            y_vals.append(
+                calibration_results["calibration"]
+                .get(key, {})
+                .get("avg_length", np.nan)
+            )
         ax.plot(alphas, y_vals, marker="s", label=f"sigma={sigma:g}")
     ax.axhline(y=150, color="red", linestyle=":", alpha=0.5, label="min length")
     ax.set_xlabel("Alpha")
@@ -899,7 +759,9 @@ def create_plots(
     fig, axes = plt.subplots(1, 2, figsize=(16, 6))
 
     ax = axes[0]
-    ax.scatter(cos_sims, alpha_effs, s=90, c="#1976D2", edgecolors="black", linewidths=0.5)
+    ax.scatter(
+        cos_sims, alpha_effs, s=90, c="#1976D2", edgecolors="black", linewidths=0.5
+    )
     ax.set_xlabel("Cosine Similarity")
     ax.set_ylabel("Effective Alpha")
     ax.set_title(
@@ -910,8 +772,22 @@ def create_plots(
     ax = axes[1]
     x = np.arange(len(gated))
     width = 0.35
-    ax.bar(x - width / 2, h_base, width, label="Baseline", color="#90CAF9", edgecolor="#1565C0")
-    ax.bar(x + width / 2, h_gated, width, label="Dynamic gating", color="#FFB74D", edgecolor="#E65100")
+    ax.bar(
+        x - width / 2,
+        h_base,
+        width,
+        label="Baseline",
+        color="#90CAF9",
+        edgecolor="#1565C0",
+    )
+    ax.bar(
+        x + width / 2,
+        h_gated,
+        width,
+        label="Dynamic gating",
+        color="#FFB74D",
+        edgecolor="#E65100",
+    )
     ax.axhline(y=0, color="gray", linestyle="--", alpha=0.5)
     ax.set_ylabel("Honesty Score")
     ax.set_title("Baseline vs Dynamic Gating")
@@ -934,9 +810,18 @@ def main():
     parser.add_argument("--prompts-file", type=str, default=Config.PROMPTS_FILE)
     parser.add_argument("--output-dir", type=str, default=Config.OUTPUT_ROOT)
     parser.add_argument("--plots-dir", type=str, default=None)
-    parser.add_argument("--vector-source", type=str, default="disentangled", choices=["disentangled", "ttpd"])
-    parser.add_argument("--sigmas", type=float, nargs="+", default=Config.CALIBRATION_SIGMAS)
-    parser.add_argument("--alphas", type=float, nargs="+", default=Config.CALIBRATION_ALPHAS)
+    parser.add_argument(
+        "--vector-source",
+        type=str,
+        default="disentangled",
+        choices=["disentangled", "ttpd"],
+    )
+    parser.add_argument(
+        "--sigmas", type=float, nargs="+", default=Config.CALIBRATION_SIGMAS
+    )
+    parser.add_argument(
+        "--alphas", type=float, nargs="+", default=Config.CALIBRATION_ALPHAS
+    )
     parser.add_argument("--gate-sharpness", type=float, default=Config.GATE_SHARPNESS)
     parser.add_argument("--batch-size", type=int, default=Config.BATCH_SIZE)
     parser.add_argument("--max-tokens", type=int, default=Config.MAX_NEW_TOKENS)
@@ -975,7 +860,9 @@ def main():
     print(f"Batch size: {config.BATCH_SIZE}")
 
     print("\n[1/6] Loading steering vectors...")
-    steering_vectors = load_steering_vectors(args.data_dir, args.vector_source, Config.ALL_LAYERS)
+    steering_vectors = load_steering_vectors(
+        args.data_dir, args.vector_source, Config.ALL_LAYERS
+    )
 
     print("\n[2/6] Loading model...")
     model, tokenizer, device = load_model(config)
@@ -1070,7 +957,9 @@ def main():
         "gating": gating_results,
     }
 
-    results_path = f"{results_dir}/phase7_calibration_gating_results_{args.vector_source}.json"
+    results_path = (
+        f"{results_dir}/phase7_calibration_gating_results_{args.vector_source}.json"
+    )
     with open(results_path, "w") as f:
         json.dump(final_results, f, indent=2, default=str)
 

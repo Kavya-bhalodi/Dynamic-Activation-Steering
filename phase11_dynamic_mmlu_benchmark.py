@@ -36,10 +36,21 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 import matplotlib
+
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
+from steering_utils import (
+    BaseConfig,
+    init_environment,
+    load_model,
+    load_steering_vectors,
+    compute_gaussian_weights,
+    compute_per_layer_alphas,
+    generate_responses_batched,
+)
+
 import torch.nn.functional as F
 import transformers
 from transformers import AutoModelForCausalLM, AutoTokenizer
@@ -53,61 +64,10 @@ transformers.logging.set_verbosity_error()
 
 
 # Verify process sees exactly one GPU slice.
-if torch.cuda.is_available():
-    device_count = torch.cuda.device_count()
-    if device_count != 1:
-        raise RuntimeError(
-            f"CRITICAL ERROR: Expected 1 GPU, but saw {device_count}. Isolation failed!"
-        )
-
-    def _norm_uuid(value: Any) -> str:
-        text = str(value).strip().lower()
-        if text.startswith("mig-"):
-            text = text[4:]
-        if text.startswith("gpu-"):
-            text = text[4:]
-        return text
-
-    def _resolve_parent_gpu_uuid_for_mig(mig_uuid: str) -> Optional[str]:
-        # PyTorch may report parent GPU UUID even when CUDA_VISIBLE_DEVICES is a MIG UUID.
-        import re as _re
-        import subprocess
-
-        try:
-            output = subprocess.check_output(["nvidia-smi", "-L"], text=True)
-        except Exception:
-            return None
-
-        current_gpu_uuid = None
-        target_norm = _norm_uuid(mig_uuid)
-
-        for line in output.splitlines():
-            gpu_match = _re.search(r"GPU\s+\d+:\s+.*\(UUID:\s*(GPU-[^)]+)\)", line)
-            if gpu_match:
-                current_gpu_uuid = gpu_match.group(1)
-                continue
-
-            mig_match = _re.search(r"MIG\s+.*\(UUID:\s*(MIG-[^)]+)\)", line)
-            if mig_match and _norm_uuid(mig_match.group(1)) == target_norm:
-                return current_gpu_uuid
-
-        return None
-
-    actual_uuid = torch.cuda.get_device_properties(0).uuid
-    expected_norms = {_norm_uuid(target_uuid)}
-    parent_uuid = _resolve_parent_gpu_uuid_for_mig(target_uuid)
-    if parent_uuid:
-        expected_norms.add(_norm_uuid(parent_uuid))
-
-    if _norm_uuid(actual_uuid) not in expected_norms:
-        raise RuntimeError(
-            f"CRITICAL ERROR: Expected MIG {target_uuid}, but got {actual_uuid}. "
-            "Refusing to run on the wrong GPU slice."
-        )
-    print(f"Verified: App is locked to MIG Instance {actual_uuid}")
+init_environment()
 
 
-class Config:
+class Config(BaseConfig):
     MODEL_NAME = "NousResearch/Meta-Llama-3-8B-Instruct"
 
     # Dedicated Phase 11 paths
@@ -151,15 +111,6 @@ class Config:
 
 
 CHOICE_LABELS = ["A", "B", "C", "D"]
-
-
-def compute_per_layer_alphas(
-    layers: List[int], alpha_base: float, peak_layer: int = 16, sigma: float = 3.0
-) -> Dict[int, float]:
-    return {
-        layer: alpha_base * np.exp(-((layer - peak_layer) ** 2) / (2 * sigma**2))
-        for layer in layers
-    }
 
 
 class SentinelMMLUPipeline:
@@ -246,7 +197,9 @@ class SentinelMMLUPipeline:
             if hidden_states.shape[-1] != expected_hidden_size:
                 return output
 
-            vec = steering_vec.to(dtype=hidden_states.dtype, device=hidden_states.device)
+            vec = steering_vec.to(
+                dtype=hidden_states.dtype, device=hidden_states.device
+            )
             gate_scales = self.current_batch_gate_scales
 
             if hidden_states.ndim == 3:
@@ -316,16 +269,22 @@ class SentinelMMLUPipeline:
             if layer_idx >= n_layers:
                 continue
             layer = self.model.model.layers[layer_idx]
-            self.hooks.append(layer.register_forward_hook(self._create_steering_hook(layer_idx)))
+            self.hooks.append(
+                layer.register_forward_hook(self._create_steering_hook(layer_idx))
+            )
 
         sentinel_idx = self.config.SENTINEL_LAYER
         if sentinel_idx >= n_layers:
             sentinel_idx = n_layers - 1
-            print(f"  [Sentinel] Adjusted layer to {sentinel_idx} (model has {n_layers})")
+            print(
+                f"  [Sentinel] Adjusted layer to {sentinel_idx} (model has {n_layers})"
+            )
 
         self.sentinel_layer_actual = sentinel_idx
         sentinel_layer = self.model.model.layers[sentinel_idx]
-        self.hooks.append(sentinel_layer.register_forward_hook(self._create_sentinel_hook()))
+        self.hooks.append(
+            sentinel_layer.register_forward_hook(self._create_sentinel_hook())
+        )
 
     def remove_hooks(self):
         for hook in self.hooks:
@@ -493,48 +452,6 @@ class SentinelMMLUPipeline:
         return results
 
 
-def load_steering_vectors(
-    data_dir: str,
-    source: str = "disentangled",
-    layers: Optional[List[int]] = None,
-) -> Dict[str, np.ndarray]:
-    vectors: Dict[str, np.ndarray] = {}
-
-    if source == "disentangled":
-        sv_path = f"{data_dir}/steering_vectors_disentangled.npz"
-        key_template = "{}_theta_true"
-    elif source == "ttpd":
-        sv_path = f"{data_dir}/steering_vectors_ttpd.npz"
-        key_template = "{}_t_G"
-    else:
-        raise ValueError(f"Unknown source: {source}")
-
-    if not os.path.exists(sv_path):
-        raise FileNotFoundError(
-            f"Steering vectors not found at {sv_path}. "
-            "Place steering_vectors_disentangled.npz in phase11_data/activations/."
-        )
-
-    print(f"\nLoading {source} vectors from {sv_path}")
-    sv = np.load(sv_path)
-    for layer_idx in (layers or Config.ALL_LAYERS):
-        layer_name = f"layer_{layer_idx}"
-        key = key_template.format(layer_name)
-        if key in sv:
-            vectors[layer_name] = sv[key]
-        else:
-            alt_key = (
-                f"{layer_name}_theta_true_unit"
-                if source == "disentangled"
-                else f"{layer_name}_t_G_unit"
-            )
-            if alt_key in sv:
-                vectors[layer_name] = sv[alt_key]
-
-    print(f"  Loaded vectors for {len(vectors)} layers")
-    return vectors
-
-
 def _build_synthetic_vectors(model, layers: List[int]) -> Dict[str, np.ndarray]:
     rng = np.random.RandomState(42)
     vectors: Dict[str, np.ndarray] = {}
@@ -543,59 +460,10 @@ def _build_synthetic_vectors(model, layers: List[int]) -> Dict[str, np.ndarray]:
         if layer_idx >= len(model.model.layers):
             continue
         vec = rng.randn(hidden).astype(np.float32)
-        vec /= (np.linalg.norm(vec) + 1e-8)
+        vec /= np.linalg.norm(vec) + 1e-8
         vectors[f"layer_{layer_idx}"] = vec
     print(f"Using synthetic steering vectors for {len(vectors)} layers (test mode)")
     return vectors
-
-
-def load_model(config: Config, test_mode: bool = False):
-    if test_mode:
-        model_name = "TinyLlama/TinyLlama-1.1B-Chat-v1.0"
-        print(f"\nLoading TEST model: {model_name}")
-        tokenizer = AutoTokenizer.from_pretrained(model_name)
-        if tokenizer.pad_token is None:
-            tokenizer.pad_token = tokenizer.eos_token
-        model = AutoModelForCausalLM.from_pretrained(model_name, torch_dtype=torch.float32)
-        model.eval()
-        return model, tokenizer, "cpu"
-
-    print(f"\nLoading model: {config.MODEL_NAME}")
-    tokenizer = AutoTokenizer.from_pretrained(config.MODEL_NAME, token=config.HF_TOKEN)
-    if tokenizer.pad_token is None:
-        tokenizer.pad_token = tokenizer.eos_token
-
-    if config.USE_4BIT:
-        from transformers import BitsAndBytesConfig
-
-        quant_config = BitsAndBytesConfig(
-            load_in_4bit=True,
-            bnb_4bit_quant_type="nf4",
-            bnb_4bit_compute_dtype=torch.float16,
-            bnb_4bit_use_double_quant=True,
-        )
-        model = AutoModelForCausalLM.from_pretrained(
-            config.MODEL_NAME,
-            quantization_config=quant_config,
-            device_map="auto",
-            token=config.HF_TOKEN,
-        )
-    else:
-        model = AutoModelForCausalLM.from_pretrained(
-            config.MODEL_NAME,
-            torch_dtype=torch.bfloat16,
-            device_map="auto",
-            token=config.HF_TOKEN,
-        )
-
-    model.eval()
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-
-    if torch.cuda.is_available():
-        print(f"  Visible GPUs: {torch.cuda.device_count()}")
-        print(f"  Initial memory allocated: {torch.cuda.memory_allocated()/1e9:.2f} GB")
-
-    return model, tokenizer, device
 
 
 def format_mmlu_prompt(question: str, choices: List[str]) -> str:
@@ -628,44 +496,6 @@ def extract_answer_letter(response: str) -> Optional[str]:
         return match.group(1).upper()
 
     return None
-
-
-def generate_responses_batched(
-    model,
-    tokenizer,
-    prompts: List[str],
-    config: Config,
-) -> List[str]:
-    if not prompts:
-        return []
-
-    tokenizer.padding_side = "left"
-    inputs = tokenizer(
-        prompts,
-        return_tensors="pt",
-        max_length=2048,
-        truncation=True,
-        padding=True,
-    )
-    input_device = next(model.parameters()).device
-    inputs = {k: v.to(input_device) for k, v in inputs.items()}
-    input_len = inputs["input_ids"].shape[1]
-
-    with torch.no_grad():
-        outputs = model.generate(
-            **inputs,
-            max_new_tokens=config.MAX_NEW_TOKENS,
-            temperature=config.TEMPERATURE,
-            top_p=config.TOP_P,
-            do_sample=config.DO_SAMPLE,
-            pad_token_id=tokenizer.pad_token_id,
-        )
-
-    generated_ids = outputs[:, input_len:]
-    responses = tokenizer.batch_decode(generated_ids, skip_special_tokens=True)
-
-    del inputs, outputs
-    return [r.strip() for r in responses]
 
 
 def _normalize_mmlu_item(item: Dict[str, Any]) -> Dict[str, Any]:
@@ -852,9 +682,15 @@ def run_sentinel_mmlu_benchmark(
         questions = subjects_dict[subject]
         n_questions = len(questions)
 
-        base_existing = list(results.get("baseline", {}).get(subject, {}).get("data", []))
-        steer_existing = list(results.get("steered", {}).get(subject, {}).get("data", []))
-        sent_existing = list(results.get("sentinel", {}).get(subject, {}).get("data", []))
+        base_existing = list(
+            results.get("baseline", {}).get(subject, {}).get("data", [])
+        )
+        steer_existing = list(
+            results.get("steered", {}).get(subject, {}).get("data", [])
+        )
+        sent_existing = list(
+            results.get("sentinel", {}).get(subject, {}).get("data", [])
+        )
 
         aligned_len = min(len(base_existing), len(steer_existing), len(sent_existing))
         if len(base_existing) != aligned_len:
@@ -865,7 +701,9 @@ def run_sentinel_mmlu_benchmark(
             sent_existing = sent_existing[:aligned_len]
 
         start_q = (
-            progress["question_idx"] if subject_idx == progress["subject_idx"] else aligned_len
+            progress["question_idx"]
+            if subject_idx == progress["subject_idx"]
+            else aligned_len
         )
         start_q = max(start_q, aligned_len)
 
@@ -895,17 +733,25 @@ def run_sentinel_mmlu_benchmark(
 
         while idx < n_questions:
             batch = questions[idx : idx + batch_size]
-            prompts = [format_mmlu_prompt(item["question"], item["choices"]) for item in batch]
+            prompts = [
+                format_mmlu_prompt(item["question"], item["choices"]) for item in batch
+            ]
 
             try:
                 pipeline.disable_steering()
-                baseline_responses = generate_responses_batched(model, tokenizer, prompts, config)
+                baseline_responses = generate_responses_batched(
+                    model, tokenizer, prompts, config
+                )
 
-                gate_scores = pipeline.compute_gate_scores_batched(model, tokenizer, prompts)
+                gate_scores = pipeline.compute_gate_scores_batched(
+                    model, tokenizer, prompts
+                )
                 gate_scales = pipeline.get_gated_alpha_scales(gate_scores)
 
                 pipeline.enable_steering(gate_scales)
-                steered_responses = generate_responses_batched(model, tokenizer, prompts, config)
+                steered_responses = generate_responses_batched(
+                    model, tokenizer, prompts, config
+                )
 
                 sentinel_rows = pipeline.run_sentinel_prefill_batched(
                     model,
@@ -917,7 +763,9 @@ def run_sentinel_mmlu_benchmark(
             except torch.cuda.OutOfMemoryError:
                 if batch_size > 1:
                     batch_size = max(1, batch_size // 2)
-                    print(f"  [OOM] Reducing batch size to {batch_size} and retrying...")
+                    print(
+                        f"  [OOM] Reducing batch size to {batch_size} and retrying..."
+                    )
                     if torch.cuda.is_available():
                         torch.cuda.empty_cache()
                     gc.collect()
@@ -1035,7 +883,9 @@ def run_sentinel_mmlu_benchmark(
             elapsed = time.time() - run_start
             run_done = done_questions - start_done
             rate = run_done / elapsed if elapsed > 0 and run_done > 0 else 0.0
-            rem_min = ((total_questions - done_questions) / rate / 60) if rate > 0 else 0.0
+            rem_min = (
+                ((total_questions - done_questions) / rate / 60) if rate > 0 else 0.0
+            )
             done_subject = len(baseline_data)
 
             if done_subject <= 2 or done_subject % max(10, config.BATCH_SIZE) == 0:
@@ -1094,7 +944,9 @@ def run_sentinel_mmlu_benchmark(
     return results
 
 
-def create_plots(results: Dict[str, Dict[str, Any]], plots_dir: str, config: Config) -> Dict[str, Any]:
+def create_plots(
+    results: Dict[str, Dict[str, Any]], plots_dir: str, config: Config
+) -> Dict[str, Any]:
     os.makedirs(plots_dir, exist_ok=True)
 
     subjects = sorted(results.get("baseline", {}).keys())
@@ -1104,8 +956,12 @@ def create_plots(results: Dict[str, Dict[str, Any]], plots_dir: str, config: Con
 
     acc_b = [results["baseline"][s]["metrics"]["accuracy"] for s in subjects]
     acc_s = [results["steered"][s]["metrics"]["accuracy"] for s in subjects]
-    det_r = [results["sentinel"][s]["metrics"].get("detection_rate", 0.0) for s in subjects]
-    avg_nr = [results["sentinel"][s]["metrics"].get("avg_norm_ratio", 1.0) for s in subjects]
+    det_r = [
+        results["sentinel"][s]["metrics"].get("detection_rate", 0.0) for s in subjects
+    ]
+    avg_nr = [
+        results["sentinel"][s]["metrics"].get("avg_norm_ratio", 1.0) for s in subjects
+    ]
 
     short_names = [s.replace("_", " ").title()[:24] for s in subjects]
     y = np.arange(len(subjects))
@@ -1113,7 +969,9 @@ def create_plots(results: Dict[str, Dict[str, Any]], plots_dir: str, config: Con
     total_b = sum(results["baseline"][s]["metrics"]["correct"] for s in subjects)
     total_s = sum(results["steered"][s]["metrics"]["correct"] for s in subjects)
     total_n = sum(results["baseline"][s]["metrics"]["total"] for s in subjects)
-    total_det = sum(results["sentinel"][s]["metrics"].get("detected", 0) for s in subjects)
+    total_det = sum(
+        results["sentinel"][s]["metrics"].get("detected", 0) for s in subjects
+    )
 
     overall_b = total_b / total_n if total_n else 0.0
     overall_s = total_s / total_n if total_n else 0.0
@@ -1125,8 +983,22 @@ def create_plots(results: Dict[str, Dict[str, Any]], plots_dir: str, config: Con
 
     width = 0.35
     ax = axes[0, 0]
-    ax.barh(y - width / 2, acc_b, width, label="Baseline", color="#90CAF9", edgecolor="#1565C0")
-    ax.barh(y + width / 2, acc_s, width, label="Steered + Sentinel Gate", color="#42A5F5", edgecolor="#0D47A1")
+    ax.barh(
+        y - width / 2,
+        acc_b,
+        width,
+        label="Baseline",
+        color="#90CAF9",
+        edgecolor="#1565C0",
+    )
+    ax.barh(
+        y + width / 2,
+        acc_s,
+        width,
+        label="Steered + Sentinel Gate",
+        color="#42A5F5",
+        edgecolor="#0D47A1",
+    )
     ax.set_yticks(y)
     ax.set_yticklabels(short_names, fontsize=8)
     ax.set_xlabel("Accuracy")
@@ -1169,7 +1041,9 @@ def create_plots(results: Dict[str, Dict[str, Any]], plots_dir: str, config: Con
 
     ax = axes[1, 0]
     deltas = [s - b for b, s in zip(acc_b, acc_s)]
-    colors = ["#EF5350" if d < -0.05 else "#66BB6A" if d > 0.05 else "#BDBDBD" for d in deltas]
+    colors = [
+        "#EF5350" if d < -0.05 else "#66BB6A" if d > 0.05 else "#BDBDBD" for d in deltas
+    ]
     ax.barh(y, deltas, color=colors, edgecolor="gray", height=0.6)
     ax.set_yticks(y)
     ax.set_yticklabels(short_names, fontsize=8)
@@ -1211,7 +1085,8 @@ def create_plots(results: Dict[str, Dict[str, Any]], plots_dir: str, config: Con
         "overall_accuracy_delta": overall_delta,
         "overall_sentinel_detection_rate": overall_det_rate,
         "overall_avg_norm_ratio": overall_avg_ratio,
-        "accuracy_collapse_detected": overall_delta < -config.ACCURACY_COLLAPSE_THRESHOLD,
+        "accuracy_collapse_detected": overall_delta
+        < -config.ACCURACY_COLLAPSE_THRESHOLD,
     }
 
     print(f"Saved: {out_path}")
@@ -1257,7 +1132,9 @@ def main():
 
     parser.add_argument("--batch-size", type=int, default=Config.BATCH_SIZE)
     parser.add_argument("--max-new-tokens", type=int, default=Config.MAX_NEW_TOKENS)
-    parser.add_argument("--max-samples", type=int, default=0, help="0 means full dataset")
+    parser.add_argument(
+        "--max-samples", type=int, default=0, help="0 means full dataset"
+    )
 
     parser.add_argument("--sigma", type=float, default=Config.SIGMA)
     parser.add_argument("--alpha-peak", type=float, default=Config.ALPHA_PEAK)
@@ -1268,7 +1145,9 @@ def main():
     parser.add_argument("--gate-sharpness", type=float, default=Config.GATE_SHARPNESS)
 
     parser.add_argument("--sentinel-layer", type=int, default=Config.SENTINEL_LAYER)
-    parser.add_argument("--noise-scale-frac", type=float, default=Config.NOISE_SCALE_FRAC)
+    parser.add_argument(
+        "--noise-scale-frac", type=float, default=Config.NOISE_SCALE_FRAC
+    )
     parser.add_argument("--noise-samples", type=int, default=Config.N_NOISE_SAMPLES)
     parser.add_argument(
         "--sentinel-collapse-threshold",
@@ -1372,7 +1251,9 @@ def main():
         except Exception as exc:
             print(f"WARNING: Could not save fallback MMLU JSON locally: {exc}")
     elif os.path.exists(config.MMLU_PATH):
-        all_data, subjects_dict = load_mmlu_from_json(config.MMLU_PATH, max_samples=max_samples)
+        all_data, subjects_dict = load_mmlu_from_json(
+            config.MMLU_PATH, max_samples=max_samples
+        )
     elif args.allow_hf_fallback:
         all_data, subjects_dict = load_mmlu_from_hf(
             dataset_name=args.hf_dataset,
@@ -1394,10 +1275,14 @@ def main():
         )
 
     print("\n[3/5] Loading steering vectors...")
-    if args.test and not os.path.exists(f"{config.DATA_DIR}/steering_vectors_{args.vector_source}.npz"):
+    if args.test and not os.path.exists(
+        f"{config.DATA_DIR}/steering_vectors_{args.vector_source}.npz"
+    ):
         vectors = _build_synthetic_vectors(model, Config.ALL_LAYERS)
     else:
-        vectors = load_steering_vectors(config.DATA_DIR, args.vector_source, Config.ALL_LAYERS)
+        vectors = load_steering_vectors(
+            config.DATA_DIR, args.vector_source, Config.ALL_LAYERS
+        )
 
     print("\n[4/5] Initializing pipeline + running benchmark...")
     pipeline = SentinelMMLUPipeline(
@@ -1422,7 +1307,9 @@ def main():
     print("\n[5/5] Saving outputs and plots...")
     summary = create_plots(results, plots_dir, config)
 
-    results_path = f"{results_dir}/phase11_sentinel_mmlu_results_{args.vector_source}.json"
+    results_path = (
+        f"{results_dir}/phase11_sentinel_mmlu_results_{args.vector_source}.json"
+    )
     final_payload = {
         "metadata": {
             "model": config.MODEL_NAME,

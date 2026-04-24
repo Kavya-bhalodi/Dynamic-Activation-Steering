@@ -32,71 +32,30 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 import matplotlib
+
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
 import scipy.stats as stats
 import torch
+from steering_utils import (
+    BaseConfig,
+    init_environment,
+    load_model,
+    load_steering_vectors,
+    compute_gaussian_weights,
+    compute_per_layer_alphas,
+    generate_responses_batched,
+)
+
 import torch.nn.functional as F
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
-
 # Verify process sees exactly one GPU slice.
-if torch.cuda.is_available():
-    device_count = torch.cuda.device_count()
-    if device_count != 1:
-        raise RuntimeError(
-            f"CRITICAL ERROR: Expected 1 GPU, but saw {device_count}. Isolation failed!"
-        )
-
-    def _norm_uuid(value: Any) -> str:
-        text = str(value).strip().lower()
-        if text.startswith("mig-"):
-            text = text[4:]
-        if text.startswith("gpu-"):
-            text = text[4:]
-        return text
-
-    def _resolve_parent_gpu_uuid_for_mig(mig_uuid: str) -> Optional[str]:
-        # PyTorch may report parent GPU UUID even when CUDA_VISIBLE_DEVICES is a MIG UUID.
-        import re
-
-        try:
-            output = subprocess.check_output(["nvidia-smi", "-L"], text=True)
-        except Exception:
-            return None
-
-        current_gpu_uuid = None
-        target_norm = _norm_uuid(mig_uuid)
-
-        for line in output.splitlines():
-            gpu_match = re.search(r"GPU\s+\d+:\s+.*\(UUID:\s*(GPU-[^)]+)\)", line)
-            if gpu_match:
-                current_gpu_uuid = gpu_match.group(1)
-                continue
-
-            mig_match = re.search(r"MIG\s+.*\(UUID:\s*(MIG-[^)]+)\)", line)
-            if mig_match and _norm_uuid(mig_match.group(1)) == target_norm:
-                return current_gpu_uuid
-
-        return None
-
-    actual_uuid = torch.cuda.get_device_properties(0).uuid
-    expected_norms = {_norm_uuid(target_uuid)}
-    parent_uuid = _resolve_parent_gpu_uuid_for_mig(target_uuid)
-    if parent_uuid:
-        expected_norms.add(_norm_uuid(parent_uuid))
-
-    if _norm_uuid(actual_uuid) not in expected_norms:
-        raise RuntimeError(
-            f"CRITICAL ERROR: Expected MIG {target_uuid}, but got {actual_uuid}. "
-            "Refusing to run on the wrong GPU slice."
-        )
-
-    print(f"Verified: App is locked to MIG Instance {actual_uuid}")
+init_environment()
 
 
-class Config:
+class Config(BaseConfig):
     MODEL_NAME = "NousResearch/Meta-Llama-3-8B-Instruct"
 
     # Dedicated Phase 8 paths
@@ -137,13 +96,6 @@ class Config:
     HF_TOKEN = os.environ.get("HF_TOKEN", "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")
 
 
-def compute_per_layer_alphas(layers, alpha_base, peak_layer=16, sigma=3.0):
-    return {
-        layer: alpha_base * np.exp(-((layer - peak_layer) ** 2) / (2 * sigma**2))
-        for layer in layers
-    }
-
-
 def load_eval_prompts(prompts_file: str) -> List[Dict[str, Any]]:
     candidates = [
         Path(prompts_file),
@@ -155,7 +107,9 @@ def load_eval_prompts(prompts_file: str) -> List[Dict[str, Any]]:
         if path.exists():
             with open(path, "r") as f:
                 payload = json.load(f)
-            prompts = payload.get("eval_prompts", payload if isinstance(payload, list) else [])
+            prompts = payload.get(
+                "eval_prompts", payload if isinstance(payload, list) else []
+            )
             if prompts:
                 print(f"Loaded {len(prompts)} eval prompts from {path}")
                 return prompts
@@ -163,154 +117,9 @@ def load_eval_prompts(prompts_file: str) -> List[Dict[str, Any]]:
     return []
 
 
-def load_model(config: Config, test_mode: bool = False):
-    if test_mode:
-        model_name = "TinyLlama/TinyLlama-1.1B-Chat-v1.0"
-        print(f"\nLoading TEST model: {model_name}")
-        tokenizer = AutoTokenizer.from_pretrained(model_name)
-        if tokenizer.pad_token is None:
-            tokenizer.pad_token = tokenizer.eos_token
-        model = AutoModelForCausalLM.from_pretrained(model_name, torch_dtype=torch.float32)
-        model.eval()
-        return model, tokenizer, "cpu"
-
-    print(f"\nLoading model: {config.MODEL_NAME}")
-    tokenizer = AutoTokenizer.from_pretrained(config.MODEL_NAME, token=config.HF_TOKEN)
-    if tokenizer.pad_token is None:
-        tokenizer.pad_token = tokenizer.eos_token
-
-    if config.USE_4BIT:
-        from transformers import BitsAndBytesConfig
-
-        quant_config = BitsAndBytesConfig(
-            load_in_4bit=True,
-            bnb_4bit_quant_type="nf4",
-            bnb_4bit_compute_dtype=torch.float16,
-            bnb_4bit_use_double_quant=True,
-        )
-        model = AutoModelForCausalLM.from_pretrained(
-            config.MODEL_NAME,
-            quantization_config=quant_config,
-            device_map="auto",
-            token=config.HF_TOKEN,
-        )
-    else:
-        model = AutoModelForCausalLM.from_pretrained(
-            config.MODEL_NAME,
-            torch_dtype=torch.bfloat16,
-            device_map="auto",
-            token=config.HF_TOKEN,
-        )
-
-    model.eval()
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    if torch.cuda.is_available():
-        print(f"  Initial GPU memory: {torch.cuda.memory_allocated()/1e9:.2f} GB")
-
-    return model, tokenizer, device
-
-
-def load_steering_vectors(data_dir: str, source: str = "disentangled", layers: Optional[List[int]] = None):
-    vectors = {}
-
-    if source == "disentangled":
-        sv_path = f"{data_dir}/steering_vectors_disentangled.npz"
-        key_template = "{}_theta_true"
-    else:
-        sv_path = f"{data_dir}/steering_vectors_ttpd.npz"
-        key_template = "{}_t_G"
-
-    if not os.path.exists(sv_path):
-        raise FileNotFoundError(
-            f"Steering vectors not found: {sv_path}. "
-            "Place steering_vectors_disentangled.npz in phase8_data/activations/."
-        )
-
-    print(f"\nLoading {source} vectors from {sv_path}")
-    sv = np.load(sv_path)
-
-    for layer_idx in (layers or Config.ALL_LAYERS):
-        layer_name = f"layer_{layer_idx}"
-        key = key_template.format(layer_name)
-        if key in sv:
-            vectors[layer_name] = sv[key]
-        else:
-            alt_key = (
-                f"{layer_name}_theta_true_unit"
-                if source == "disentangled"
-                else f"{layer_name}_t_G_unit"
-            )
-            if alt_key in sv:
-                vectors[layer_name] = sv[alt_key]
-
-    print(f"  Loaded vectors for {len(vectors)} layers")
-    return vectors
-
-
-def generate_responses_batched(
-    model,
-    tokenizer,
-    prompts: List[str],
-    config: Config,
-    batch_size: int,
-) -> List[str]:
-    if not prompts:
-        return []
-
-    tokenizer.padding_side = "left"
-    responses: List[str] = []
-    idx = 0
-    local_batch_size = max(1, batch_size)
-
-    while idx < len(prompts):
-        chunk = prompts[idx : idx + local_batch_size]
-        try:
-            inputs = tokenizer(
-                chunk,
-                return_tensors="pt",
-                max_length=1024,
-                truncation=True,
-                padding=True,
-            )
-            input_device = next(model.parameters()).device
-            inputs = {k: v.to(input_device) for k, v in inputs.items()}
-            input_len = inputs["input_ids"].shape[1]
-
-            with torch.no_grad():
-                outputs = model.generate(
-                    **inputs,
-                    max_new_tokens=config.MAX_NEW_TOKENS,
-                    max_length=None,
-                    temperature=config.TEMPERATURE,
-                    top_p=config.TOP_P,
-                    do_sample=config.DO_SAMPLE,
-                    pad_token_id=tokenizer.pad_token_id,
-                )
-
-            generated_ids = outputs[:, input_len:]
-            decoded = tokenizer.batch_decode(generated_ids, skip_special_tokens=True)
-            responses.extend([d.strip() for d in decoded])
-
-            del inputs, outputs
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
-
-            idx += len(chunk)
-
-        except torch.cuda.OutOfMemoryError:
-            if local_batch_size > 1:
-                local_batch_size = max(1, local_batch_size // 2)
-                print(f"  [OOM] Reducing generation batch size to {local_batch_size}")
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
-                gc.collect()
-                continue
-            raise RuntimeError("OOM at generation batch size 1")
-
-    return responses
-
-
-def compute_honesty_score(response: str, honesty_keywords: List[str], deception_keywords: List[str]) -> Dict[str, float]:
+def compute_honesty_score(
+    response: str, honesty_keywords: List[str], deception_keywords: List[str]
+) -> Dict[str, float]:
     response_lower = response.lower()
     honest_hits = sum(1 for kw in honesty_keywords if kw.lower() in response_lower)
     deceptive_hits = sum(1 for kw in deception_keywords if kw.lower() in response_lower)
@@ -346,13 +155,17 @@ class SentinelPipeline:
                     vec = vec[: self.hidden_size]
                 else:
                     continue
-            self.steering_tensors[layer_idx] = torch.tensor(vec, dtype=torch.float32, device=device)
+            self.steering_tensors[layer_idx] = torch.tensor(
+                vec, dtype=torch.float32, device=device
+            )
 
         gate_key = f"layer_{config.GATE_LAYER}"
         if gate_key in steering_vectors:
             gv = np.asarray(steering_vectors[gate_key]).flatten()
             n = np.linalg.norm(gv)
-            self.gate_truth_dir = torch.tensor(gv / (n + 1e-8), dtype=torch.float32, device=device)
+            self.gate_truth_dir = torch.tensor(
+                gv / (n + 1e-8), dtype=torch.float32, device=device
+            )
         else:
             self.gate_truth_dir = None
 
@@ -381,7 +194,9 @@ class SentinelPipeline:
                 return output
 
             alpha_l = self.layer_alphas[layer_idx] * self.current_alpha_scale
-            perturbation = (alpha_l * steering_vec).to(dtype=hidden.dtype, device=hidden.device)
+            perturbation = (alpha_l * steering_vec).to(
+                dtype=hidden.dtype, device=hidden.device
+            )
 
             if hidden.dim() == 3:
                 modified = hidden + perturbation.view(1, 1, -1)
@@ -415,17 +230,23 @@ class SentinelPipeline:
             if layer_idx not in self.steering_tensors:
                 continue
             layer = self.model.model.layers[layer_idx]
-            self.hooks.append(layer.register_forward_hook(self._create_steering_hook(layer_idx)))
+            self.hooks.append(
+                layer.register_forward_hook(self._create_steering_hook(layer_idx))
+            )
 
         sentinel_idx = self.config.SENTINEL_LAYER
         n_layers = len(self.model.model.layers)
         if sentinel_idx >= n_layers:
             sentinel_idx = n_layers - 1
-            print(f"  [Sentinel] Adjusted layer to {sentinel_idx} (model has {n_layers})")
+            print(
+                f"  [Sentinel] Adjusted layer to {sentinel_idx} (model has {n_layers})"
+            )
 
         self.sentinel_layer_actual = sentinel_idx
         sentinel_layer = self.model.model.layers[sentinel_idx]
-        self.hooks.append(sentinel_layer.register_forward_hook(self._create_sentinel_hook()))
+        self.hooks.append(
+            sentinel_layer.register_forward_hook(self._create_sentinel_hook())
+        )
 
     def remove_hooks(self):
         for hook in self.hooks:
@@ -439,7 +260,9 @@ class SentinelPipeline:
         was_active = self.steering_active
         self.steering_active = False
 
-        inputs = tokenizer(prompt, return_tensors="pt", max_length=1024, truncation=True)
+        inputs = tokenizer(
+            prompt, return_tensors="pt", max_length=1024, truncation=True
+        )
         input_device = next(model.parameters()).device
         inputs = {k: v.to(input_device) for k, v in inputs.items()}
 
@@ -477,7 +300,9 @@ class SentinelPipeline:
     def run_sentinel_test(self, model, tokenizer, prompt: str) -> Dict[str, Any]:
         self.sentinel_activation = None
 
-        inputs = tokenizer(prompt, return_tensors="pt", max_length=1024, truncation=True)
+        inputs = tokenizer(
+            prompt, return_tensors="pt", max_length=1024, truncation=True
+        )
         input_device = next(model.parameters()).device
         inputs = {k: v.to(input_device) for k, v in inputs.items()}
 
@@ -505,7 +330,10 @@ class SentinelPipeline:
         n = self.config.N_NOISE_SAMPLES
         noise_scale = self.config.NOISE_SCALE_FRAC * clean_norm
 
-        noise = torch.randn(n, act.shape[0], device=act.device, dtype=act.dtype) * noise_scale
+        noise = (
+            torch.randn(n, act.shape[0], device=act.device, dtype=act.dtype)
+            * noise_scale
+        )
         noisy = act.unsqueeze(0) + noise
         noisy_norms = noisy.norm(p=2, dim=1)
         norm_ratios = (noisy_norms / clean_norm).detach().cpu().tolist()
@@ -550,7 +378,9 @@ def run_full_pipeline(
             if isinstance(ckpt, dict):
                 results = ckpt.get("results", results)
                 start_idx = int(ckpt.get("completed", 0))
-                print(f"Resuming from checkpoint: {checkpoint_path} (completed={start_idx})")
+                print(
+                    f"Resuming from checkpoint: {checkpoint_path} (completed={start_idx})"
+                )
         except Exception as exc:
             print(f"WARNING: Failed to load checkpoint ({exc}); starting fresh")
 
@@ -562,7 +392,9 @@ def run_full_pipeline(
         elapsed = time.time() - t0
         rate = (i - start_idx + 1) / elapsed if elapsed > 0 else 0.0
         rem_min = (total - i - 1) / rate / 60 if rate > 0 else 0.0
-        print(f"\n[{i+1}/{total}] {p.get('id','prompt')} ({p.get('category','unknown')})  rem={rem_min:.1f}m")
+        print(
+            f"\n[{i+1}/{total}] {p.get('id','prompt')} ({p.get('category','unknown')})  rem={rem_min:.1f}m"
+        )
 
         prompt_text = p["prompt"]
         run_prompts = [prompt_text] * config.N_RUNS
@@ -573,7 +405,8 @@ def run_full_pipeline(
             model, tokenizer, run_prompts, config, batch_size=config.BATCH_SIZE
         )
         base_scores = [
-            compute_honesty_score(r, p["honesty_keywords"], p["deception_keywords"]) for r in base_responses
+            compute_honesty_score(r, p["honesty_keywords"], p["deception_keywords"])
+            for r in base_responses
         ]
         base_h = [s["honesty_score"] for s in base_scores]
         base_l = [len(r.split()) for r in base_responses]
@@ -590,7 +423,8 @@ def run_full_pipeline(
             model, tokenizer, run_prompts, config, batch_size=config.BATCH_SIZE
         )
         steered_scores = [
-            compute_honesty_score(r, p["honesty_keywords"], p["deception_keywords"]) for r in steered_responses
+            compute_honesty_score(r, p["honesty_keywords"], p["deception_keywords"])
+            for r in steered_responses
         ]
         steer_h = [s["honesty_score"] for s in steered_scores]
         steer_l = [len(r.split()) for r in steered_responses]
@@ -599,7 +433,9 @@ def run_full_pipeline(
         sentinel_runs = []
         for _ in range(config.N_RUNS):
             pipeline.steering_active = True
-            sentinel_runs.append(pipeline.run_sentinel_test(model, tokenizer, prompt_text))
+            sentinel_runs.append(
+                pipeline.run_sentinel_test(model, tokenizer, prompt_text)
+            )
 
         valid_sentinel = [s for s in sentinel_runs if "avg_norm_ratio" in s]
         all_ratios = []
@@ -637,9 +473,25 @@ def run_full_pipeline(
             {
                 "prompt_id": p.get("id", f"prompt_{i}"),
                 "category": p.get("category", "unknown"),
-                "clean_norm": float(np.mean([s.get("clean_norm", 0.0) for s in valid_sentinel])) if valid_sentinel else 0.0,
-                "avg_norm_ratio": float(np.mean([s.get("avg_norm_ratio", 1.0) for s in valid_sentinel])) if valid_sentinel else 1.0,
-                "min_norm_ratio": float(np.min([s.get("min_norm_ratio", 1.0) for s in valid_sentinel])) if valid_sentinel else 1.0,
+                "clean_norm": (
+                    float(np.mean([s.get("clean_norm", 0.0) for s in valid_sentinel]))
+                    if valid_sentinel
+                    else 0.0
+                ),
+                "avg_norm_ratio": (
+                    float(
+                        np.mean([s.get("avg_norm_ratio", 1.0) for s in valid_sentinel])
+                    )
+                    if valid_sentinel
+                    else 1.0
+                ),
+                "min_norm_ratio": (
+                    float(
+                        np.min([s.get("min_norm_ratio", 1.0) for s in valid_sentinel])
+                    )
+                    if valid_sentinel
+                    else 1.0
+                ),
                 "norm_ratios": all_ratios,
                 "deception_detected": any_detected,
             }
@@ -694,7 +546,13 @@ def create_plots(results, config: Config, plots_dir: str):
     colors = ["#EF5350" if d else "#66BB6A" for d in detected]
 
     ax = axes[0, 0]
-    ax.bar(range(len(prompt_ids)), clean_norms, color=colors, edgecolor="black", linewidth=0.5)
+    ax.bar(
+        range(len(prompt_ids)),
+        clean_norms,
+        color=colors,
+        edgecolor="black",
+        linewidth=0.5,
+    )
     ax.set_xticks(range(len(prompt_ids)))
     ax.set_xticklabels(prompt_ids, rotation=45, fontsize=8)
     ax.set_ylabel("L2 Norm (Sentinel Layer)")
@@ -706,10 +564,25 @@ def create_plots(results, config: Config, plots_dir: str):
     for s in sentinel:
         all_ratios.extend(s.get("norm_ratios", []))
     if all_ratios:
-        ax.hist(all_ratios, bins=30, color="#42A5F5", edgecolor="black", alpha=0.8, linewidth=0.5)
+        ax.hist(
+            all_ratios,
+            bins=30,
+            color="#42A5F5",
+            edgecolor="black",
+            alpha=0.8,
+            linewidth=0.5,
+        )
         collapse_thresh = 1.0 / config.COLLAPSE_THRESHOLD
-        ax.axvline(x=collapse_thresh, color="red", linestyle="--", linewidth=2, label=f"Collapse threshold ({collapse_thresh:.3f})")
-        ax.axvline(x=1.0, color="green", linestyle="-", alpha=0.5, label="No change (1.0)")
+        ax.axvline(
+            x=collapse_thresh,
+            color="red",
+            linestyle="--",
+            linewidth=2,
+            label=f"Collapse threshold ({collapse_thresh:.3f})",
+        )
+        ax.axvline(
+            x=1.0, color="green", linestyle="-", alpha=0.5, label="No change (1.0)"
+        )
     ax.set_xlabel("||x+e|| / ||x||")
     ax.set_ylabel("Count")
     ax.set_title("Noise Robustness Distribution")
@@ -717,9 +590,21 @@ def create_plots(results, config: Config, plots_dir: str):
     ax.grid(True, alpha=0.3)
 
     ax = axes[1, 0]
-    ax.bar(range(len(prompt_ids)), avg_ratios, color=colors, edgecolor="black", linewidth=0.5)
+    ax.bar(
+        range(len(prompt_ids)),
+        avg_ratios,
+        color=colors,
+        edgecolor="black",
+        linewidth=0.5,
+    )
     ct = 1.0 / config.COLLAPSE_THRESHOLD
-    ax.axhline(y=ct, color="red", linestyle="--", linewidth=2, label=f"Collapse threshold ({ct:.3f})")
+    ax.axhline(
+        y=ct,
+        color="red",
+        linestyle="--",
+        linewidth=2,
+        label=f"Collapse threshold ({ct:.3f})",
+    )
     ax.set_xticks(range(len(prompt_ids)))
     ax.set_xticklabels(prompt_ids, rotation=45, fontsize=8)
     ax.set_ylabel("Avg ||x+e|| / ||x||")
@@ -730,8 +615,22 @@ def create_plots(results, config: Config, plots_dir: str):
     ax = axes[1, 1]
     x = np.arange(len(prompt_ids))
     width = 0.35
-    ax.bar(x - width / 2, base_h, width, label="Baseline", color="#90CAF9", edgecolor="#1565C0")
-    ax.bar(x + width / 2, steered_h, width, label="Steered + Gated", color="#FFB74D", edgecolor="#E65100")
+    ax.bar(
+        x - width / 2,
+        base_h,
+        width,
+        label="Baseline",
+        color="#90CAF9",
+        edgecolor="#1565C0",
+    )
+    ax.bar(
+        x + width / 2,
+        steered_h,
+        width,
+        label="Steered + Gated",
+        color="#FFB74D",
+        edgecolor="#E65100",
+    )
     ax.axhline(y=0, color="gray", linestyle="-", alpha=0.3)
     ax.set_xticks(x)
     ax.set_xticklabels(prompt_ids, rotation=45, fontsize=8)
@@ -755,19 +654,36 @@ def create_plots(results, config: Config, plots_dir: str):
     ax = axes[0]
     methods = ["Baseline", "Steered + Gated"]
     honesties = [avg_base_h, avg_steer_h]
-    bars = ax.bar(methods, honesties, color=["#90CAF9", "#FFB74D"], edgecolor="black", linewidth=1.2, width=0.5)
+    bars = ax.bar(
+        methods,
+        honesties,
+        color=["#90CAF9", "#FFB74D"],
+        edgecolor="black",
+        linewidth=1.2,
+        width=0.5,
+    )
     for b, h in zip(bars, honesties):
-        ax.text(b.get_x() + b.get_width() / 2, h + 0.02, f"{h:+.3f}", ha="center", fontsize=12)
+        ax.text(
+            b.get_x() + b.get_width() / 2,
+            h + 0.02,
+            f"{h:+.3f}",
+            ha="center",
+            fontsize=12,
+        )
     ax.set_ylabel("Avg Honesty Score")
     ax.set_ylim(-0.2, 1.1)
-    ax.set_title(f"Pipeline Summary (a={config.ALPHA_PEAK}, s={config.SIGMA}, tau={config.GATE_THRESHOLD})")
+    ax.set_title(
+        f"Pipeline Summary (a={config.ALPHA_PEAK}, s={config.SIGMA}, tau={config.GATE_THRESHOLD})"
+    )
     ax.grid(True, alpha=0.3, axis="y")
 
     ax = axes[1]
     cat_labels = sorted(set(s["category"] for s in sentinel))
     cat_ratios = {}
     for cat in cat_labels:
-        cat_vals = [s.get("avg_norm_ratio", 1.0) for s in sentinel if s["category"] == cat]
+        cat_vals = [
+            s.get("avg_norm_ratio", 1.0) for s in sentinel if s["category"] == cat
+        ]
         cat_ratios[cat] = float(np.mean(cat_vals)) if cat_vals else 1.0
 
     sorted_items = sorted(cat_ratios.items(), key=lambda x: x[1])
@@ -777,7 +693,9 @@ def create_plots(results, config: Config, plots_dir: str):
     bar_colors = ["#EF5350" if v < ct else "#66BB6A" for v in cat_vals]
 
     ax.barh(cat_names, cat_vals, color=bar_colors, edgecolor="black", linewidth=0.5)
-    ax.axvline(x=ct, color="red", linestyle="--", linewidth=2, label=f"Collapse ({ct:.3f})")
+    ax.axvline(
+        x=ct, color="red", linestyle="--", linewidth=2, label=f"Collapse ({ct:.3f})"
+    )
     ax.set_xlabel("Avg Norm Ratio")
     ax.set_title(f"Sentinel Category Robustness (flagged {n_detected}/{len(sentinel)})")
     ax.legend(fontsize=9)
@@ -789,7 +707,9 @@ def create_plots(results, config: Config, plots_dir: str):
 
     print(f"Saved: {plots_dir}/16_sentinel_protocol.png")
     print(f"Saved: {plots_dir}/17_pipeline_comparison.png")
-    print(f"Summary: baseline_h={avg_base_h:+.3f}, steered_h={avg_steer_h:+.3f}, detections={n_detected}")
+    print(
+        f"Summary: baseline_h={avg_base_h:+.3f}, steered_h={avg_steer_h:+.3f}, detections={n_detected}"
+    )
 
 
 def run_test_mode(config: Config, args):
@@ -831,7 +751,9 @@ def run_test_mode(config: Config, args):
         ]
 
     checkpoint_path = f"{args.output_dir}/results/test_checkpoint.json"
-    results = run_full_pipeline(model, tokenizer, pipeline, prompts, config, checkpoint_path, resume=False)
+    results = run_full_pipeline(
+        model, tokenizer, pipeline, prompts, config, checkpoint_path, resume=False
+    )
 
     os.makedirs(args.plots_dir, exist_ok=True)
     create_plots(results, config, args.plots_dir)
@@ -848,7 +770,12 @@ def main():
     parser.add_argument("--prompts-file", type=str, default=Config.PROMPTS_FILE)
     parser.add_argument("--output-dir", type=str, default=Config.OUTPUT_ROOT)
     parser.add_argument("--plots-dir", type=str, default=None)
-    parser.add_argument("--vector-source", type=str, default="disentangled", choices=["disentangled", "ttpd"])
+    parser.add_argument(
+        "--vector-source",
+        type=str,
+        default="disentangled",
+        choices=["disentangled", "ttpd"],
+    )
     parser.add_argument("--batch-size", type=int, default=Config.BATCH_SIZE)
     parser.add_argument("--max-tokens", type=int, default=Config.MAX_NEW_TOKENS)
     parser.add_argument("--n-runs", type=int, default=Config.N_RUNS)
@@ -891,7 +818,9 @@ def main():
         )
 
     print("\n[1/5] Loading steering vectors...")
-    steering_vectors = load_steering_vectors(config.DATA_DIR, args.vector_source, Config.ALL_LAYERS)
+    steering_vectors = load_steering_vectors(
+        config.DATA_DIR, args.vector_source, Config.ALL_LAYERS
+    )
 
     print("\n[2/5] Loading model...")
     model, tokenizer, device = load_model(config)
