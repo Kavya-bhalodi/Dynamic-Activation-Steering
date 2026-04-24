@@ -1,3 +1,6 @@
+import sys
+import os
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 import os, json, gc, time, re, math
 import torch
 import numpy as np
@@ -6,7 +9,7 @@ from typing import Dict, List, Any, Optional, Tuple
 import matplotlib.pyplot as plt
 import scipy.stats as stats
 from collections import defaultdict
-from steering_utils import BaseConfig, init_environment, load_model, load_steering_vectors, compute_gaussian_weights, compute_per_layer_alphas, generate_responses_batched, SentinelPipeline
+from utils.steering_utils import BaseConfig, init_environment, load_model, load_steering_vectors, compute_gaussian_weights, compute_per_layer_alphas, generate_responses_batched, SentinelPipeline
 init_environment()
 get_ipython().system('pip install -q transformers accelerate bitsandbytes scipy matplotlib numpy huggingface_hub')
 import os, sys, json, time, gc, re
@@ -14,14 +17,14 @@ import numpy as np
 from typing import Dict, List, Optional, Tuple
 from collections import defaultdict
 import torch
-from steering_utils import BaseConfig, init_environment, load_model, load_steering_vectors, compute_gaussian_weights, compute_per_layer_alphas, generate_responses_batched
+from utils.steering_utils import BaseConfig, init_environment, load_model, load_steering_vectors, compute_gaussian_weights, compute_per_layer_alphas, generate_responses_batched
 import torch.nn.functional as F
 from transformers import AutoTokenizer, AutoModelForCausalLM
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
-assert torch.cuda.is_available(), '❌ No GPU detected!\nGo to: Notebook Settings → Accelerator → GPU T4 x2'
-print(f'✅ GPU count : {torch.cuda.device_count()}')
+assert torch.cuda.is_available(), ' No GPU detected!\nGo to: Notebook Settings → Accelerator → GPU T4 x2'
+print(f' GPU count : {torch.cuda.device_count()}')
 for i in range(torch.cuda.device_count()):
     props = torch.cuda.get_device_properties(i)
     print(f'   GPU {i}    : {torch.cuda.get_device_name(i)}  ({props.total_mem / 1000000000.0:.1f} GB)')
@@ -42,31 +45,31 @@ MASK_SPLITS = ['continuous', 'double_down_known_facts', 'provided_facts', 'stati
 print('Verifying input paths...')
 errors = []
 if not os.path.isdir(MASK_DIR):
-    errors.append(f'  ❌ MASK benchmark directory not found: {MASK_DIR}')
+    errors.append(f'   MASK benchmark directory not found: {MASK_DIR}')
 else:
-    print(f'  ✅ MASK benchmark dir : {MASK_DIR}')
+    print(f'   MASK benchmark dir : {MASK_DIR}')
     for split in MASK_SPLITS:
         json_path = os.path.join(MASK_DIR, f'{split}.json')
         if os.path.isfile(json_path):
-            print(f'    ✅ {split}.json')
+            print(f'     {split}.json')
         else:
-            errors.append(f'  ❌ MASK split file not found: {json_path}')
+            errors.append(f'   MASK split file not found: {json_path}')
 sv_disentangled = os.path.join(ACTIVATIONS_DIR, 'steering_vectors_disentangled.npz')
 sv_ttpd = os.path.join(ACTIVATIONS_DIR, 'steering_vectors_ttpd.npz')
 if not os.path.isfile(sv_disentangled) and (not os.path.isfile(sv_ttpd)):
-    errors.append(f'  ❌ Steering vectors not found in: {ACTIVATIONS_DIR}')
+    errors.append(f'   Steering vectors not found in: {ACTIVATIONS_DIR}')
 else:
     found = [f for f in [sv_disentangled, sv_ttpd] if os.path.isfile(f)]
     for f in found:
-        print(f'  ✅ Steering vectors: {os.path.basename(f)}')
+        print(f'   Steering vectors: {os.path.basename(f)}')
 if os.path.isdir(LOCAL_MODEL_DIR):
-    print(f'  ✅ Local model dir : {LOCAL_MODEL_DIR}')
+    print(f'   Local model dir : {LOCAL_MODEL_DIR}')
 else:
-    print(f'  ℹ️  No local model dir — will download from HuggingFace')
-print(f'\n  📁 Plots output   : {PLOTS_DIR}')
-print(f'  📁 Results output : {RESULTS_DIR}')
+    print(f'    No local model dir — will download from HuggingFace')
+print(f'\n   Plots output   : {PLOTS_DIR}')
+print(f'   Results output : {RESULTS_DIR}')
 if errors:
-    print('\n⚠️  PATH ERRORS DETECTED:')
+    print('\n  PATH ERRORS DETECTED:')
     for e in errors:
         print(e)
     print(f'\n  Listing contents of {KAGGLE_INPUT_BASE}:')
@@ -88,7 +91,7 @@ if errors:
                 print(f'      {item}/')
     raise FileNotFoundError('Fix the paths above before continuing.')
 else:
-    print('\n✅ All input paths verified!')
+    print('\n All input paths verified!')
 
 class Config(BaseConfig):
     MODEL_NAME = 'NousResearch/Meta-Llama-3-8B-Instruct'
@@ -152,11 +155,11 @@ for split in config.MASK_SPLITS:
     if dataset is not None:
         mask_datasets[split] = dataset
         total_samples += len(dataset)
-print(f'\n  ✅ Loaded {len(mask_datasets)} splits, {total_samples} total samples')
+print(f'\n   Loaded {len(mask_datasets)} splits, {total_samples} total samples')
 for split, data in mask_datasets.items():
     print(f'    {split}: {len(data)} samples')
-print('✅ Gaussian depth schedule defined.')
-print('✅ SentinelPipeline class defined (Dynamic Gating + Steering + Deception Detection).')
+print(' Gaussian depth schedule defined.')
+print(' SentinelPipeline class defined (Dynamic Gating + Steering + Deception Detection).')
 print('[1/5] Loading steering vectors...')
 steering_vectors = load_steering_vectors(ACTIVATIONS_DIR, VECTOR_SOURCE)
 print('[2/5] Loading model...')
@@ -169,7 +172,7 @@ print(f'  Gate     : τ={config.GATE_THRESHOLD}, layer=L{config.GATE_LAYER}, k={
 print(f'  Sentinel : layer=L{pipeline.sentinel_layer_actual}, noise={config.NOISE_SCALE_FRAC * 100:.0f}%, collapse={config.COLLAPSE_THRESHOLD_SENTINEL}')
 print(f'  Steering tensors loaded for layers: {sorted(pipeline.steering_tensors.keys())}')
 print(f"  Dynamic gating: {('ENABLED' if config.USE_DYNAMIC_GATE else 'DISABLED')}")
-print('  ✅ Pipeline ready.')
+print('   Pipeline ready.')
 import ast
 from functools import lru_cache
 EMBED_CACHE = {}

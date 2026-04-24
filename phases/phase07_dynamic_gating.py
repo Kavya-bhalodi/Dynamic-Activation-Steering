@@ -1,3 +1,6 @@
+import sys
+import os
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 import os, json, gc, time, re, math
 import torch
 import numpy as np
@@ -6,7 +9,7 @@ from typing import Dict, List, Any, Optional, Tuple
 import matplotlib.pyplot as plt
 import scipy.stats as stats
 from collections import defaultdict
-from steering_utils import BaseConfig, init_environment, load_model, load_steering_vectors, compute_gaussian_weights, compute_per_layer_alphas, generate_responses_batched, GaussianDepthSteerer, DynamicGate, compute_honesty_score, compute_quality_score
+from utils.steering_utils import BaseConfig, init_environment, load_model, load_steering_vectors, compute_gaussian_weights, compute_per_layer_alphas, generate_responses_batched, GaussianDepthSteerer, DynamicGate, compute_honesty_score, compute_quality_score
 init_environment()
 import os
 target_uuid = 'MIG-e5d78ce7-5816-5a4a-80e4-760fd53e696d'
@@ -25,7 +28,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 import scipy.stats as stats
 import torch
-from steering_utils import BaseConfig, init_environment, load_model, load_steering_vectors, compute_gaussian_weights, compute_per_layer_alphas, generate_responses_batched
+from utils.steering_utils import BaseConfig, init_environment, load_model, load_steering_vectors, compute_gaussian_weights, compute_per_layer_alphas, generate_responses_batched
 import transformers
 from transformers import AutoModelForCausalLM, AutoTokenizer
 transformers.logging.set_verbosity_error()
