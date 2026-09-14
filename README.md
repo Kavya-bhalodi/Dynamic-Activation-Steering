@@ -41,11 +41,22 @@ The DAS framework was evaluated on Llama-3-8B-Instruct (4-bit NF4 quantization) 
 
 ## ⚙️ How It Works
 
-1. **Activation Extraction**: Prompts are passed through the model and activations are isolated over the `<scratchpad>` tokens.
-2. **Steering (Forward Pass Modification)**: For identified deceptive queries, the truth vector $\theta_{true}$ is added to the residual stream with a depth-wise Gaussian scaling factor $\alpha_L$:
-   $$x'_L = x_L + \alpha_L \cdot \theta_{true}$$
-3. **Detection**: At Layer 31, noise is injected. If the activation norm explodes ($\frac{||x_{31} + \epsilon||_2}{||x_{31}||_2} > 1.0075$), generation is aborted.
+1. **Activation Extraction**: Prompts are passed through the model, and activations are isolated over the `<scratchpad>` tokens.
 
+2. **Steering (Forward Pass Modification)**: For identified deceptive queries, the truth vector $\theta_{true}$ is added to the residual stream with a depth-wise Gaussian scaling factor $\alpha_L$:
+
+$$
+x'_L = x_L + \alpha_L \cdot \theta_{true}
+$$
+
+3. **Detection**: At Layer 31, noise is injected. If the activation norm explodes:
+
+$$
+\frac{\lVert x_{31} + \epsilon \rVert_2}{\lVert x_{31} \rVert_2} > 1.0075
+$$
+
+generation is aborted.
+   
 ## 📜 Citation & Credits
 
 Authors: Shail Shah, Chaitanya Shah, Tathya Vaghasia, Soham Sadavarte, Kavya Bhalodi.
